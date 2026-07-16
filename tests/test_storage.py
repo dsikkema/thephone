@@ -1,6 +1,7 @@
 # pytest
 from phoneapp.storage import Storage
 from datetime import datetime, timezone, timedelta
+import time
 import pytest
 
 @pytest.fixture
@@ -9,6 +10,9 @@ def storage(conn):
 
 p1 = '1234567890'
 p2 = '7777777777'
+
+_1s = timedelta(seconds=1)
+start = datetime.fromtimestamp(int(time.time()), timezone.utc) - timedelta(seconds=30)
 
 def onerow(conn, sql):
     cur = conn.execute(sql)
@@ -89,7 +93,7 @@ def test_save_new_sent_message(conn, storage):
 
     # Message 1 Conv 1
     m1='hey'
-    inserted_id = storage.save_new_sent_message(p1, m1)
+    _, inserted_id = storage.save_new_sent_message(p1, m1)
     (_, cid1, success1, content1, sent_at1) = onerow(
         conn,
         f"select * from sent_messages where id={inserted_id}"
@@ -102,7 +106,7 @@ def test_save_new_sent_message(conn, storage):
 
     # Message 2 Conv 1
     m2="hey again"
-    inserted_id = storage.save_new_sent_message(p1, m2)
+    _, inserted_id = storage.save_new_sent_message(p1, m2)
     (_, cid2, success2, content2, sent_at2) = onerow(
         conn,
         f"select * from sent_messages where id={inserted_id}"
@@ -115,7 +119,7 @@ def test_save_new_sent_message(conn, storage):
 
     # Message 1 Conv 2
     m3="hey again three"
-    inserted_id = storage.save_new_sent_message(p2, m3)
+    _, inserted_id = storage.save_new_sent_message(p2, m3)
     (_, cid3, success3, content3, sent_at3) = onerow(
         conn,
         f"select * from sent_messages where id={inserted_id}"
@@ -127,7 +131,7 @@ def test_save_new_sent_message(conn, storage):
     assert isinstance(sent_at3, int)
 
 def test_mark_successful_send(conn, storage):
-    inserted_id = storage.save_new_sent_message(p1, "hey")
+    _, inserted_id = storage.save_new_sent_message(p1, "hey")
     storage.mark_successful_send(inserted_id)
     (_, cid1, success1, content1, sent_at1) = onerow(
         conn,
@@ -182,4 +186,16 @@ def test_list_conversations(conn, storage):
         (1, p2, 'what is up?')
     ]
 
+def test_get_most_recent_conversation_content(conn, storage):
+    _, r1 = storage.save_recv_message(p1, p1, 'please help me', start + _1s*3)
+    _, s2 = storage.save_new_sent_message(p1, 'ok i will help you', start+_1s*4)
+    conv_id, r3 = storage.save_recv_message(p1, p1, 'nevermind it got fixed', start+_1s*5)
+
+    res = storage.get_most_recent_conversation_content(conv_id)
+
+    assert res == [
+        (start+_1s*5, p1, 'nevermind it got fixed', None, r3),
+        (start+_1s*4, None, 'ok i will help you', s2, None),
+        (start+_1s*3, p1, 'please help me', None, r1),
+    ]
 

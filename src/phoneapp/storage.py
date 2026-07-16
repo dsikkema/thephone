@@ -46,12 +46,15 @@ class Storage:
         Lookup/create the conversation for given participants, and save the message
 
         (Note: for a two-person conversation, participants will be same as sender)
+
+        Return conv_id
         """
         conv_id=self.get_or_create_conversation(participants)
-        self.conn.execute("""
+        cur = self.conn.execute("""
             insert into recv_messages(conversation_id, sender, content, recv_at)
             values
-                (:conversation_id, :sender, :content, :recv_at);
+                (:conversation_id, :sender, :content, :recv_at)
+            returning id
             """,
             {
                 'conversation_id': conv_id,
@@ -60,12 +63,13 @@ class Storage:
                 'recv_at':int(recv_at.timestamp())
              }
         )
+        return conv_id, cur.fetchone()[0]
 
     def save_new_sent_message(self, participants, content, sent_at=None):
         """
         Lookup/create conversation, save message (sent_at is now)
 
-        Return saved message ID for later marking it successfully sent
+        Return conv_id, saved message ID (the latter for later marking it successfully sent)
         """
         if sent_at is None:
             sent_at = datetime.now(timezone.utc)
@@ -83,7 +87,7 @@ class Storage:
              }
         )
 
-        return cur.fetchone()[0]
+        return conv_id, cur.fetchone()[0]
 
     def mark_successful_send(self, message_id):
         """
@@ -169,4 +173,44 @@ class Storage:
          - sent_id (None if it is a received message)
          - recv_id (None if it is a sent message)
         """
+        cur = self.conn.execute("""
+            with all_conv_messages as (
+              select
+                conversation_id,
+                sender,
+                content,
+                recv_at as msg_time,
+                id
+              from
+                recv_messages
+              where
+                conversation_id=:conversation_id
+
+              UNION
+
+              select
+                conversation_id,
+                null as sender,
+                content,
+                sent_at as msg_time,
+                id
+              from 
+                sent_messages
+              where
+                conversation_id=:conversation_id
+            )
+            select
+                msg_time,
+                sender,
+                content,
+                case when sender is null then id else null end as sent_id, -- sender null-> is a sent not recv msg
+                case when sender is null then null else id end as recv_id
+            from all_conv_messages am
+            order by msg_time desc
+            """
+            , {
+                "conversation_id": conversation_id
+            }
+        )
+        return list(map(lambda row: ((datetime.fromtimestamp(row[0], timezone.utc),) + row[1:]), cur.fetchall()))
 
