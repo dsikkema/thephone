@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-rsync -anv --delete --exclude-from=.gitignore . dale@cyberology:phone
+if [[ $1 != '-f' ]]; then
+  rsync -anv --delete --exclude-from=.gitignore . dale@cyberology:phone
+  echo -n "Proceed? (y/n) "
+  read -n 1 proceed
+  echo
+else
+  proceed='y'
+fi
 
-echo ok
-echo -n "Proceed? (y/n) "
-read -n 1 proceed
-echo
 
 if [[ $proceed = 'y' ]]; then
   echo 'Sending'
