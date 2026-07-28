@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-rsync -anv --delete . dale@cyberology:phone
+rsync -anv --delete --exclude-from=.gitignore . dale@cyberology:phone
 
 echo ok
 echo -n "Proceed? (y/n) "
@@ -8,7 +8,7 @@ echo
 
 if [[ $proceed = 'y' ]]; then
   echo 'Sending'
-  rsync -av --delete . dale@cyberology:phone
+  rsync -av --delete --exclude-from=.gitignore . dale@cyberology:phone
 else
   echo 'Aborting'
 fi
