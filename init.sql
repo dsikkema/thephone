@@ -26,7 +26,7 @@ create table sent_messages(
   id integer primary key autoincrement,
   -- if ever delete, need cascade
   conversation_id integer not null references conversations(id),
-  sent_successfully integer not null,
+  sent_successfully integer,
   content text not null,
   -- note: do not accidentally use "%s" here: double quotes for strings
   -- are technically allowed, but trigger an indication to the engine

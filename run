@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+PYTHONUNBUFFERED=1 MYNO=15125087977 uv run phoneapp
