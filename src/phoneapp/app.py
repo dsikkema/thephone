@@ -1,8 +1,10 @@
+import re
 import os
 import termios
 import serial
 import sys
 from time import sleep
+import time
 import threading
 from .storage import Storage
 import sqlite3
@@ -13,39 +15,52 @@ HOME='\033[H'
 
 ser = serial.Serial('/dev/serial0', 115200)
 ser.flushInput()
+ser.write('ATE0\r\n'.encode())
+sleep(0.1)
+ser.write('AT+CMGF=1\r\n'.encode())
+sleep(0.1)
+# lol
+# ser.write(b'AT+CMGL="ALL"\r\n')
 
 
 ser_lock = threading.Lock()
 ser_callback = None
 
-def handle_command(cmd, log):
+def handle_command(cmd, log, storage):
     log.write(f"{int(time.time())}:{cmd}\n")
-    if cmd == 'OK' or cmd == 'ERROR':
-        if ser_callback is not None:
-            ser_callback(cmd == 'OK')
-        else:
-            log.write(f"{int(time.time())} error:{cmd} received with no callback\n")
+    if ser_callback is not None and re.match(ser_callback.pattern, cmd):
+        ser_callback(cmd, storage)
+    else:
+        log.write(f"{int(time.time())} error:{cmd} received with no callback\n")
 
-
-def server():
+def _debug_server():
     rec_buff = ''
+    while True:
+        sleep(0.05)
+        if ser.inWaiting():
+            rec_buff = ser.read(ser.inWaiting()).decode()
+def server():
+    conn = sqlite3.connect('phone.db', autocommit=True)
+    storage = Storage(conn)
+    rec_buff = ''
+    sep = '\r\n'
     try:
         with open('at_response.log', 'w') as log:
             while True:
                 sleep(0.05)
                 if ser.inWaiting():
-                    print('b')
                     sys.stdout.flush()
                     _in = ser.read(ser.inWaiting())
-                    print(_in)
                     sys.stdout.flush()
                     rec_buff += _in.decode()
-                split = rec_buff.split('\n')
+                split = rec_buff.split(sep)
+                # eliminate empty values, but don't eliminate last one even if empty
+                split = [s for s in split[:-1] if s] + [split[-1]]
                 cmds = split[:-1]
                 rec_buff = split[-1]
                 for cmd in cmds:
-                    handle_command(cmd, log)
-    except Error as e:
+                    handle_command(cmd, log, storage)
+    except BaseException as e:
         print(e)
         sys.stdout.flush()
         raise
@@ -90,29 +105,33 @@ def at_test():
 
 def send_message(rec, msg, storage):
     # ser_lock guards: ser write, callback creation
+    global ser_callback
     with ser_lock:
         callback_done = threading.Event()
-        success_flag = False
-        def send_message_callback(success):
-            global success_flag
-            if success:
-                success_flag = True 
-                storage.mark_successful_send(_id)
+        (conversation_id, _id) = storage.save_new_sent_message(rec, msg)
+        def send_message_callback(cmd, st):
+            if cmd == 'OK':
+                ser_callback.result = True 
+                st.mark_successful_send(_id)
             callback_done.set()
+        
+        # register a pattern to be handled by this (takes priority)
+        send_message_callback.pattern = 'OK|ERROR|\\+CMS ERROR: .*' 
         ser_callback = send_message_callback
+        ser_callback.result = None
 
-        # ser.write(f"AT+CMGS=\"{rec}\"\r\n".encode())
-        # sleep(0.05)
-        # ser.write(msg.encode() + b'\x1a')
-        # sleep(0.05)
-        ser.write(f"AT\r\n".encode())
-
-        _id = storage.save_new_sent_message(rec, msg)
+        ser.write(f"AT+CMGS=\"{rec}\"\r\n".encode())
+        sleep(0.05)
+        ser.write(msg.encode() + b'\x1a')
+        sleep(0.05)
+        # ser.write(f"AT\r\n".encode())
 
         # event returns False if timed_out, but we don't use that and just check the flag
         callback_done.wait(timeout=5)
-        if not success_flag:
+        if not ser_callback.result:
             print("Message failed to send.")
+        else:
+            print("Sent successfully!")
         ser_callback = None
 
 def print_list(_stdin, storage):
