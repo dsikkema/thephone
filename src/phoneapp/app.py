@@ -23,15 +23,13 @@ sleep(0.1)
 # ser.write(b'AT+CMGL="ALL"\r\n')
 
 
-ser_lock = threading.Lock()
-ser_callback = None
+# req = (func, args, kwargs) tuple
+req = None
+resp = None
+tasks = []
 
 def handle_command(cmd, log, storage):
-    log.write(f"{int(time.time())}:{cmd}\n")
-    if ser_callback is not None and re.match(ser_callback.pattern, cmd):
-        ser_callback(cmd, storage)
-    else:
-        log.write(f"{int(time.time())} error:{cmd} received with no callback\n")
+    pass
 
 def _debug_server():
     rec_buff = ''
@@ -59,12 +57,42 @@ def server():
                 cmds = split[:-1]
                 rec_buff = split[-1]
                 for cmd in cmds:
+                    # handle_command should append the correct task to task queue
                     handle_command(cmd, log, storage)
+                
+                if req:
+                    tasks.append(req)
+                    req = None
+                for t in tasks:
+                    t[0](*t[1], **t[2])
     except BaseException as e:
         print(e)
         sys.stdout.flush()
         raise
 
+def send_msg_at(rec, msg):
+    """
+    Leaving off: need to keep all serial reading in the same loop - other notifications may come in that
+    would get read by this loop if this loop read from the wire. 
+
+    Requests are serial, therefore could register a single request listener _to_ the read loop though, with
+    a callback - handled in-server
+
+    This func creates a function and a regex pattern to look for (OR|ERROR|etc), assigns it to req_callback 
+    and req_callback.pattern)- read loop's handle_command checks cmds against the req_callback.pattern
+
+    callback simply sets response val (Note: client must unset resp as soon as read it)
+
+    """
+    ser.write(f"AT+CMGS=\"{rec}\"\r\n".encode())
+    sleep(0.05)
+    ser.write(msg.encode() + b'\x1a')
+    sleep(0.05)
+    def send_message_callback(cmd, st):
+        if cmd == 'OK':
+            ser_callback.result = True 
+            st.mark_successful_send(_id)
+        callback_done.set()
 
 
 
@@ -109,21 +137,12 @@ def send_message(rec, msg, storage):
     with ser_lock:
         callback_done = threading.Event()
         (conversation_id, _id) = storage.save_new_sent_message(rec, msg)
-        def send_message_callback(cmd, st):
-            if cmd == 'OK':
-                ser_callback.result = True 
-                st.mark_successful_send(_id)
-            callback_done.set()
         
         # register a pattern to be handled by this (takes priority)
         send_message_callback.pattern = 'OK|ERROR|\\+CMS ERROR: .*' 
         ser_callback = send_message_callback
         ser_callback.result = None
 
-        ser.write(f"AT+CMGS=\"{rec}\"\r\n".encode())
-        sleep(0.05)
-        ser.write(msg.encode() + b'\x1a')
-        sleep(0.05)
         # ser.write(f"AT\r\n".encode())
 
         # event returns False if timed_out, but we don't use that and just check the flag
