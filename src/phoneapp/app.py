@@ -1,4 +1,5 @@
 import re
+import datetime
 import os
 import termios
 import serial
@@ -19,14 +20,13 @@ ser.write('ATE0\r\n'.encode())
 sleep(0.1)
 ser.write('AT+CMGF=1\r\n'.encode())
 sleep(0.1)
-# lol
-# ser.write(b'AT+CMGL="ALL"\r\n')
+# TOODO: uncomment to load unread at start
+ser.write(b'AT+CMGL="REC UNREAD"\r\n')
 
 
 # req = (func, args, kwargs) tuple
 req = None
 resp = None
-tasks = []
 
 def handle_command(cmd, log, storage):
     pass
@@ -37,63 +37,102 @@ def _debug_server():
         sleep(0.05)
         if ser.inWaiting():
             rec_buff = ser.read(ser.inWaiting()).decode()
+
+line_buffer = []
+rec_buff = ''
+def readline_at():
+    global line_buffer
+    global rec_buff
+    sep = '\r\n'
+    # always do a single read to prime the line buffer
+    if ser.inWaiting():
+        rec_buff += ser.read(ser.inWaiting()).decode()
+        split = rec_buff.split(sep)
+        line_buffer += split[:-1]
+        rec_buff = split[-1]
+    # anything to return? then do so
+    if line_buffer:
+        c = line_buffer.pop(0)
+        print(c.encode())
+        return c
+    else:
+        # while nothing to return and partial line, wait&read
+        while rec_buff and not line_buffer:
+            sleep(0.05)
+            if ser.inWaiting():
+                rec_buff += ser.read(ser.inWaiting()).decode()
+                split = rec_buff.split(sep)
+                line_buffer += split[:-1]
+                rec_buff = split[-1]
+        # either above loop read something into line_buffer (return pop buffer)
+        # or else it never entered (return None)
+        c = line_buffer.pop(0) if line_buffer else None
+        if c:
+            print(c.encode())
+        return c
+
 def server():
     conn = sqlite3.connect('phone.db', autocommit=True)
     storage = Storage(conn)
-    rec_buff = ''
-    sep = '\r\n'
+    datetime_patt = r'"(\d\d/\d\d/\d\d,\d\d:\d\d:\d\d)([-\+]+\d+)"'
     try:
-        with open('at_response.log', 'w') as log:
-            while True:
-                sleep(0.05)
-                if ser.inWaiting():
-                    sys.stdout.flush()
-                    _in = ser.read(ser.inWaiting())
-                    sys.stdout.flush()
-                    rec_buff += _in.decode()
-                split = rec_buff.split(sep)
-                # eliminate empty values, but don't eliminate last one even if empty
-                split = [s for s in split[:-1] if s] + [split[-1]]
-                cmds = split[:-1]
-                rec_buff = split[-1]
-                for cmd in cmds:
-                    # handle_command should append the correct task to task queue
-                    handle_command(cmd, log, storage)
-                
-                if req:
-                    tasks.append(req)
-                    req = None
-                for t in tasks:
-                    t[0](*t[1], **t[2])
+        while True:
+            sleep(0.2)
+            # read loop
+            cl = readline_at()
+            if cl is not None:
+                if cl.startswith("+CMTI"):
+                    match  = re.match(r'\+CMTI: "[^"]*",(\d+).*', cl)
+                    _idx = match.groups()[0]
+                    ser.write(f"AT+CMGR={_idx}\r\n".encode())
+                    sleep(0.05)
+                elif cl.startswith("+CMGR"):
+                    match  = re.match(r'\+CMGR: "[^"]+","\+(\d+)","[^"]*",' + datetime_patt, cl)
+                    if not match:
+                        print('bad match')
+                    sender = match.groups()[0]
+                    offset_num = int(match.groups()[2]) # positive or negative quarters of an hour offset from utc
+                    offset_delta = datetime.timedelta(minutes=offset_num*15)
+                    recv_at = datetime.datetime.strptime(match.groups()[1], '%y/%m/%d,%H:%M:%S').replace(
+                            tzinfo=datetime.timezone(offset_delta)
+                        )
+                    msg = ''
+                    cl = readline_at()
+                    while cl != 'OK':
+                        msg += ('\n' + cl)
+                        cl = readline_at()
+                    msg = msg.strip()
+                    storage.save_recv_message(sender, sender, msg, recv_at)
+                elif cl.startswith("+CMGL"):
+                    while cl != 'OK':
+                        match  = re.match(r'\+CMGL: \d+,"[^"]+","\+(\d+)","[^"]*",' + datetime_patt, cl)
+                        if not match:
+                            print('bad match')
+                        sender = match.groups()[0]
+                        offset_num = int(match.groups()[2]) # positive or negative quarters of an hour offset from utc
+                        offset_delta = datetime.timedelta(minutes=offset_num*15)
+                        recv_at = datetime.datetime.strptime(match.groups()[1], '%y/%m/%d,%H:%M:%S').replace(
+                            tzinfo=datetime.timezone(offset_delta)
+                        )
+                        msg = ''
+                        cl = readline_at()
+                        while cl != 'OK' and not cl.startswith('+CMGL'):
+                            msg += ('\n' + cl)
+                            cl = readline_at()
+                        if cl == 'OK':
+                            msg = msg.rstrip()
+                        storage.save_recv_message(sender, sender, msg, recv_at)
+
     except BaseException as e:
         print(e)
         sys.stdout.flush()
         raise
 
 def send_msg_at(rec, msg):
-    """
-    Leaving off: need to keep all serial reading in the same loop - other notifications may come in that
-    would get read by this loop if this loop read from the wire. 
-
-    Requests are serial, therefore could register a single request listener _to_ the read loop though, with
-    a callback - handled in-server
-
-    This func creates a function and a regex pattern to look for (OR|ERROR|etc), assigns it to req_callback 
-    and req_callback.pattern)- read loop's handle_command checks cmds against the req_callback.pattern
-
-    callback simply sets response val (Note: client must unset resp as soon as read it)
-
-    """
     ser.write(f"AT+CMGS=\"{rec}\"\r\n".encode())
     sleep(0.05)
     ser.write(msg.encode() + b'\x1a')
     sleep(0.05)
-    def send_message_callback(cmd, st):
-        if cmd == 'OK':
-            ser_callback.result = True 
-            st.mark_successful_send(_id)
-        callback_done.set()
-
 
 
 def readline(_stdin):
@@ -132,26 +171,9 @@ def at_test():
 
 
 def send_message(rec, msg, storage):
-    # ser_lock guards: ser write, callback creation
-    global ser_callback
-    with ser_lock:
-        callback_done = threading.Event()
-        (conversation_id, _id) = storage.save_new_sent_message(rec, msg)
-        
-        # register a pattern to be handled by this (takes priority)
-        send_message_callback.pattern = 'OK|ERROR|\\+CMS ERROR: .*' 
-        ser_callback = send_message_callback
-        ser_callback.result = None
-
-        # ser.write(f"AT\r\n".encode())
-
-        # event returns False if timed_out, but we don't use that and just check the flag
-        callback_done.wait(timeout=5)
-        if not ser_callback.result:
-            print("Message failed to send.")
-        else:
-            print("Sent successfully!")
-        ser_callback = None
+    (conversation_id, _id) = storage.save_new_sent_message(rec, msg)
+    send_msg_at(rec, msg)
+    storage.mark_successful_send(_id)
 
 def print_list(_stdin, storage):
     print(''.join((CLEAR, HOME)), end='')
