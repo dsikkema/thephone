@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+if [[ $(pwd) != '/Users/dale/home/work/dalephone/phoneapp' ]]; then
+  exit 1
+fi
+
 if [[ $1 != '-f' ]]; then
   rsync -anv --delete --exclude-from=.gitignore . dale@cyberology:phone
   echo -n "Proceed? (y/n) "
