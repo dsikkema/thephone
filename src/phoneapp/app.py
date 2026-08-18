@@ -1,4 +1,6 @@
 import re
+import json
+from cryptography.fernet import Fernet
 import functools
 import math
 import datetime
@@ -26,10 +28,23 @@ ser.write('AT+CMGF=1\r\n'.encode())
 sleep(0.05)
 ser.write(b'AT+CMGL="REC UNREAD"\r\n')
 sleep(0.05)
-ser.write(b'AT+CMGD=,1\r\n')
+# ser.write(b'AT+CMGD=,1\r\n')
+# enable gps
+# TOODO: maybe need to do this *right* before getting coords
+ser.write(b'AT+CGPS=1,1\r\n')
+sleep(0.05)
+ser.write(b'AT+HTTPTERM\r\n')
+sleep(0.05)
+ser.write(b'AT+HTTPINIT\r\n')
+sleep(0.05)
 
 line_buffer = []
 rec_buff = ''
+gps_coord = None
+gps_ready = threading.Event()
+http_resp = None
+http_ready = threading.Event()
+hang_up = None
 def readline_at():
     global line_buffer
     global rec_buff
@@ -43,14 +58,16 @@ def readline_at():
     # anything to return? then do so
     if line_buffer:
         c = line_buffer.pop(0)
-        # print(c.encode())
+        print(c.encode())
         return c
     else:
         # while nothing to return and partial line, wait&read
         while rec_buff and not line_buffer:
             sleep(0.05)
             if ser.inWaiting():
-                rec_buff += ser.read(ser.inWaiting()).decode()
+                _read = ser.read(ser.inWaiting())
+                sys.stdout.flush()
+                rec_buff += _read.decode()
                 split = rec_buff.split(sep)
                 line_buffer += split[:-1]
                 rec_buff = split[-1]
@@ -62,9 +79,13 @@ def readline_at():
         return c
 
 def server():
+    global gps_coord
+    global hang_up
+    global http_resp
     with sqlite3.connect('phone.db', autocommit=True) as conn:
         storage = Storage(conn)
         datetime_patt = r'"(\d\d/\d\d/\d\d,\d\d:\d\d:\d\d)([-\+]+\d+)"'
+        tasks = []
         try:
             while True:
                 sleep(0.2)
@@ -74,12 +95,13 @@ def server():
                     if cl.startswith("+CMTI"):
                         match  = re.match(r'\+CMTI: "[^"]*",(\d+).*', cl)
                         _idx = match.groups()[0]
+                        # TOODO: make CMGR write a task
                         ser.write(f"AT+CMGR={_idx}\r\n".encode())
                         sleep(0.05)
                     elif cl.startswith("+CMGR"):
-                        match  = re.match(r'\+CMGR: "[^"]+","\+(\d+)","[^"]*",' + datetime_patt, cl)
+                        match  = re.match(r'\+CMGR: "[^"]+","\+?(\d+)","[^"]*",' + datetime_patt, cl)
                         if not match:
-                            print('bad match')
+                            raise ValueError(f"bad match: {cl}")
                         sender = match.groups()[0]
                         offset_num = int(match.groups()[2]) # positive or negative quarters of an hour offset from utc
                         offset_delta = datetime.timedelta(minutes=offset_num*15)
@@ -95,7 +117,7 @@ def server():
                         storage.save_recv_message(sender, sender, msg, recv_at)
                     elif cl.startswith("+CMGL"):
                         while cl != 'OK':
-                            match  = re.match(r'\+CMGL: \d+,"[^"]+","\+(\d+)","[^"]*",' + datetime_patt, cl)
+                            match  = re.match(r'\+CMGL: \d+,"[^"]+","\+?(\d+)","[^"]*",' + datetime_patt, cl)
                             if not match:
                                 print('bad match')
                             sender = match.groups()[0]
@@ -112,12 +134,77 @@ def server():
                             if cl == 'OK':
                                 msg = msg.rstrip()
                             storage.save_recv_message(sender, sender, msg, recv_at)
+                    elif cl.startswith("+CGPSINFO"):
+                        # +CGPSINFO: 3025.118530,N,09742.830097,W,110826,054234.0,232.2,0.0,317.7
+                        match = re.match(r'\+CGPSINFO: (\d{2})(\d{2}\.\d{6}),(N|S),(\d{3})(\d{2}\.\d{6}),(E|W).*', cl)
+                        if not match:
+                            raise ValueError(f"bad match: {cl}")
+                        g = match.groups()
+                        lat_deg = g[0]
+                        lat_minutes = g[1]
+                        north_south = g[2]
+                        longitude_deg = g[3]
+                        longitude_minutes = g[4]
+                        east_west = g[5]
+
+                        lat_decimal_degree = coord_to_degrees(lat_deg, lat_minutes, north_south)
+                        long_decimal_degree = coord_to_degrees(longitude_deg, longitude_minutes, east_west)
+                        gps_coord = (lat_decimal_degree, long_decimal_degree)
+                        gps_ready.set()
+                    elif cl.startswith('+HTTPACTION'):
+                        match = re.match(r'\+HTTPACTION: \d+,(\d+),(\d+)', cl)
+                        if not match:
+                            raise ValueError(f"bad match: {cl}")
+                        g = match.groups()
+                        status_code = g[0]
+                        resp_bytes = g[1]
+                        print('read cmd')
+                        ser.write(f"AT+HTTPREAD={resp_bytes}\r\n".encode())
+                        sleep(0.5)
+                        cl = readline_at()
+
+                        # success format:
+
+                        # OK
+                        # +HTTPREAD: DATA,<data_len>
+                        # <data>
+                        # [+HTTPREAD: DATA,<data_len>
+                        # <data>
+                        # ...]
+                        # +HTTPREAD: 0
+
+                        # go until '+HTTPREAD: 0' end while skipping everything but data lines
+                        body = ''
+                        while cl != "+HTTPREAD:0" and cl != "+HTTPREAD: 0": # docs and reality disagree about the space - reality is no space
+                            if cl == 'ERROR':
+                                raise ValueError('oh no')
+                            if cl != "OK" and not cl.startswith("+HTTPREAD: "):
+                                body += cl
+                            cl = readline_at()
+                        http_resp = (status_code, body)
+                        http_ready.set()
+                        sleep(0.1)
+                    elif cl.startswith("VOICE CALL: END"):
+                        hang_up = True
+            while tasks:
+                tasks.pop(0)()
 
         except BaseException as e:
             print(e)
             sys.stdout.flush()
             raise
 
+def coord_to_degrees(degrees, minutes, direction):
+    """
+    transform a (single) coordinate value from N/S/E/W degrees and minutes
+    into positive or negative decimal degrees
+    """
+    res = float(degrees) + float(minutes)/60
+    if direction in ('W', 'S'):
+        res *= -1
+    return res
+
+# TOODO: make this a task on server that handles write
 def send_msg_at(rec, msg):
     ser.write(f"AT+CMGS=\"{rec}\"\r\n".encode())
     sleep(0.05)
@@ -226,8 +313,112 @@ def main_menu():
     return [
         ('Send Message',  print_send),
         ('List Conversations', print_list),
+        ('GPS', gps),
+        ('Place Call', phone_call),
     ]
 
+def phone_call():
+    global hang_up
+    hang_up = False
+    print("Who do you want to call?")
+    rec = readline()
+    ser.write(f"ATD{rec};\r\n".encode())
+    print("Call in progress. Press ESC to hang up.")
+    try:
+        os.set_blocking(_stdin.fileno(), False)
+        while not hang_up:
+            sleep(0.5)
+            # print('check')
+            k = _stdin.read(1)
+            if k == b'\033':
+                ser.write(b'AT+CHUP\r\n')
+    finally:
+        # re enable blocking
+        os.set_blocking(_stdin.fileno(), True)
+        
+
+def encrypt(plain):
+    # from env var
+    key = os.environ('FERNET_KEY')
+    if key is None:
+        raise RuntimeError('need the key')
+
+    fernet = Fernet(key.encode())
+    return fernet.encrypt(s.encode())
+
+def gps():
+    global gps_coord
+    global http_resp
+    gps_coord = None
+    gps_ready.clear()
+    print(''.join((CLEAR, HOME)), end='')
+    print("Enter destination:")
+    dest = readline()
+    # get coord:
+    ser.write(b'AT+CGPSINFO\r\n')
+    sleep(0.1)
+    gps_ready.wait()
+    lat_decimal_degree, long_decimal_degree = gps_coord
+    print(f"debug: coord = {lat_decimal_degree, long_decimal_degree}")
+    sleep(0.5)
+
+    # http for sever
+    http_ready.clear()
+    http_resp = None
+    print('url')
+    ser.write(b'AT+HTTPPARA="URL","http://postman-echo.com/post"\r\n')
+    sleep(0.5)
+    print('body')
+    payload='{"val":123}'.encode()
+    ser.write(f"AT+HTTPDATA={len(payload)},300\r\n".encode()) # <num bytes to send>, <num seconds to wait for input>
+    sleep(0.5)
+    # <then write data>
+    ser.write(payload)
+    sleep(0.5)
+    print('action')
+    payload='{"val":123}'.encode()
+    ser.write(b'AT+HTTPACTION=1\r\n')
+    sleep(0.5)
+    print('wait')
+    http_ready.wait()
+    resp = http_resp
+    print(f"Your response is: {resp}")
+    print('Done! Press enter to continue.')
+    readline()
+
+    # search new coord
+    # curl "https://api.mapbox.com/search/geocode/v6/forward?q=3500+Cookstown+Dr+Austin+Tx&access_token=$MAPBOX_TOKEN"
+
+    # nav to coord
+    # url encode: long/lat, %2C = ',', %3B = ';'
+    # curl "https://api.mapbox.com/directions/v5/mapbox/driving/-74.150434%2C40.811716%3B-74.136459%2C40.794178?alternatives=true&geometries=geojson&language=en&overview=full&steps=true&access_token=<tok>"
+
+    """
+    # distances in meters
+     $ jq '.routes[].legs[].steps[] | .maneuver.instruction, .distance' < instruction.json
+        "Drive northeast on Havelock Drive."
+        66.595
+        "Turn right onto Gable Drive."
+        164.972
+        "Turn right onto Adelphi Lane."
+        428.936
+        "Turn right onto Waters Park Road."
+        757.518
+        "Bear right onto North Mopac Service Road."
+        644.145
+        "Turn left onto Duval Road/FM 1325. Continue on FM 1325."
+        1282.02
+        "Turn left onto Esperanza Crossing."
+        103.685
+        "Turn left."
+        18.364
+        "Turn right."
+        10.525
+        "Bear right."
+        31.107
+        "Your destination is on the right."
+        0
+    """
 
 def print_menu(menu, init_cursor):
     sz = os.get_terminal_size()
