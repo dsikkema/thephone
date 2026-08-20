@@ -28,10 +28,9 @@ ser.write('AT+CMGF=1\r\n'.encode())
 sleep(0.05)
 ser.write(b'AT+CMGL="REC UNREAD"\r\n')
 sleep(0.05)
-# ser.write(b'AT+CMGD=,1\r\n')
-# enable gps
-# TOODO: maybe need to do this *right* before getting coords
-ser.write(b'AT+CGPS=1,1\r\n')
+# TOODO: maybe need to do this *right* before getting coords?
+ser.write(b'AT+CGPS=0\r\n')
+ser.write(b'AT+CGPS=1\r\n')
 sleep(0.05)
 ser.write(b'AT+HTTPTERM\r\n')
 sleep(0.05)
@@ -41,6 +40,7 @@ sleep(0.05)
 line_buffer = []
 rec_buff = ''
 gps_coord = None
+gps_err = None
 gps_ready = threading.Event()
 http_resp = None
 http_ready = threading.Event()
@@ -48,6 +48,7 @@ hang_up = None
 def readline_at():
     global line_buffer
     global rec_buff
+    debug = False # hardcoded lol
     sep = '\r\n'
     # always do a single read to prime the line buffer
     if ser.inWaiting():
@@ -58,7 +59,8 @@ def readline_at():
     # anything to return? then do so
     if line_buffer:
         c = line_buffer.pop(0)
-        print(c.encode())
+        if debug:
+            print(c.encode())
         return c
     else:
         # while nothing to return and partial line, wait&read
@@ -74,12 +76,13 @@ def readline_at():
         # either above loop read something into line_buffer (return pop buffer)
         # or else it never entered (return None)
         c = line_buffer.pop(0) if line_buffer else None
-        if c:
+        if debug:
             print(c.encode())
         return c
 
 def server():
     global gps_coord
+    global gps_err
     global hang_up
     global http_resp
     with sqlite3.connect('phone.db', autocommit=True) as conn:
@@ -134,22 +137,25 @@ def server():
                             if cl == 'OK':
                                 msg = msg.rstrip()
                             storage.save_recv_message(sender, sender, msg, recv_at)
+                        # once we've successfully processed the list, delete unread
+                        ser.write(b'AT+CMGD=,1\r\n')
                     elif cl.startswith("+CGPSINFO"):
-                        # +CGPSINFO: 3025.118530,N,09742.830097,W,110826,054234.0,232.2,0.0,317.7
+                        # +CGPSINFO: 9999.999999,N,99999.999999,W,...
                         match = re.match(r'\+CGPSINFO: (\d{2})(\d{2}\.\d{6}),(N|S),(\d{3})(\d{2}\.\d{6}),(E|W).*', cl)
                         if not match:
-                            raise ValueError(f"bad match: {cl}")
-                        g = match.groups()
-                        lat_deg = g[0]
-                        lat_minutes = g[1]
-                        north_south = g[2]
-                        longitude_deg = g[3]
-                        longitude_minutes = g[4]
-                        east_west = g[5]
+                            gps_err = "GPS unavailable"
+                        else:
+                            g = match.groups()
+                            lat_deg = g[0]
+                            lat_minutes = g[1]
+                            north_south = g[2]
+                            longitude_deg = g[3]
+                            longitude_minutes = g[4]
+                            east_west = g[5]
 
-                        lat_decimal_degree = coord_to_degrees(lat_deg, lat_minutes, north_south)
-                        long_decimal_degree = coord_to_degrees(longitude_deg, longitude_minutes, east_west)
-                        gps_coord = (lat_decimal_degree, long_decimal_degree)
+                            lat_decimal_degree = coord_to_degrees(lat_deg, lat_minutes, north_south)
+                            long_decimal_degree = coord_to_degrees(longitude_deg, longitude_minutes, east_west)
+                            gps_coord = (lat_decimal_degree, long_decimal_degree)
                         gps_ready.set()
                     elif cl.startswith('+HTTPACTION'):
                         match = re.match(r'\+HTTPACTION: \d+,(\d+),(\d+)', cl)
@@ -158,7 +164,6 @@ def server():
                         g = match.groups()
                         status_code = g[0]
                         resp_bytes = g[1]
-                        print('read cmd')
                         ser.write(f"AT+HTTPREAD={resp_bytes}\r\n".encode())
                         sleep(0.5)
                         cl = readline_at()
@@ -288,7 +293,7 @@ def render_conv(_id, participants):
         k = _stdin.read(1).decode()
         if k == 'j' and last_line_idx < len(rendered_lines) - 1:
             last_line_idx += 1
-        elif k == 'k' and last_line_idx > rows:
+        elif k == 'k' and last_line_idx >= rows:
             last_line_idx -= 1
         elif k == '\n':
             print_send(rec=participants)
@@ -319,12 +324,14 @@ def main_menu():
 
 def phone_call():
     global hang_up
-    hang_up = False
-    print("Who do you want to call?")
-    rec = readline()
-    ser.write(f"ATD{rec};\r\n".encode())
-    print("Call in progress. Press ESC to hang up.")
+    print(''.join((CLEAR, HOME)), end='')
+    print('Ctrl+C to exit')
     try:
+        hang_up = False
+        print("Who do you want to call?")
+        rec = readline()
+        ser.write(f"ATD{rec};\r\n".encode())
+        print("Call in progress. Press ESC to hang up.")
         os.set_blocking(_stdin.fileno(), False)
         while not hang_up:
             sleep(0.5)
@@ -332,93 +339,132 @@ def phone_call():
             k = _stdin.read(1)
             if k == b'\033':
                 ser.write(b'AT+CHUP\r\n')
+    except KeyboardInterrupt:
+        pass
     finally:
         # re enable blocking
         os.set_blocking(_stdin.fileno(), True)
         
 
 def encrypt(plain):
-    # from env var
-    key = os.environ('FERNET_KEY')
+    key = os.environ.get('FERNET_KEY')
     if key is None:
         raise RuntimeError('need the key')
 
     fernet = Fernet(key.encode())
-    return fernet.encrypt(s.encode())
+    return fernet.encrypt(plain.encode()).decode()
+
+def decrypt(enc):
+    key = os.environ.get('FERNET_KEY')
+    if key is None:
+        raise RuntimeError('need the key')
+
+    fernet = Fernet(key.encode())
+    return fernet.decrypt(enc.encode()).decode()
+
+def gps_coords():
+    global gps_coord
+    global gps_err
+
+    lat_decimal_degree = None
+    long_decimal_degree = None
+    tries = 0
+    max_tries = 5
+    print(''.join((CLEAR, HOME)), end='')
+    while (lat_decimal_degree is None or long_decimal_degree is None) and tries <= max_tries:
+        gps_coord = None
+        gps_ready.clear()
+        gps_err = None
+        # get coord:
+        ser.write(b'AT+CGPSINFO\r\n')
+        gps_ready.wait()
+        if gps_err is not None:
+            gps_err = None
+            print("Waiting on signal...")
+            sleep(5)
+        else:
+            lat_decimal_degree, long_decimal_degree = gps_coord
+    if (lat_decimal_degree is None or long_decimal_degree is None):
+        return None
+
+    return lat_decimal_degree, long_decimal_degree
 
 def gps():
-    global gps_coord
     global http_resp
-    gps_coord = None
-    gps_ready.clear()
-    print(''.join((CLEAR, HOME)), end='')
+    coord = gps_coords()
+    if coord is None:
+        print("Sorry, GPS encountered an error (any key to esc)")
+        readline()
+        return
     print("Enter destination:")
     dest = readline()
-    # get coord:
-    ser.write(b'AT+CGPSINFO\r\n')
-    sleep(0.1)
-    gps_ready.wait()
-    lat_decimal_degree, long_decimal_degree = gps_coord
-    print(f"debug: coord = {lat_decimal_degree, long_decimal_degree}")
-    sleep(0.5)
+    lat_decimal_degree, long_decimal_degree = coord
 
     # http for sever
     http_ready.clear()
     http_resp = None
-    print('url')
-    ser.write(b'AT+HTTPPARA="URL","http://postman-echo.com/post"\r\n')
-    sleep(0.5)
-    print('body')
-    payload='{"val":123}'.encode()
-    ser.write(f"AT+HTTPDATA={len(payload)},300\r\n".encode()) # <num bytes to send>, <num seconds to wait for input>
-    sleep(0.5)
+    ser.write(b'AT+HTTPPARA="URL","http://dalesikkema.com/server"\r\n')
+    sleep(0.1)
+    ser.write(b'AT+HTTPPARA="CONTENT","application/json"\r\n')
+    sleep(0.1)
+    plain_req_data = {
+        "path": "navigation_directions",
+        "body": {
+                "to_address": dest,
+                "fromLat": lat_decimal_degree,
+                "fromLong": long_decimal_degree
+            }
+    }
+    enc_req_content = encrypt(json.dumps(plain_req_data))
+    payload = json.dumps({"enc_content": enc_req_content}).encode()
+
+    ser.write(f"AT+HTTPDATA={len(payload)},10\r\n".encode()) # <num bytes to send>, <num seconds to wait for input>
+    sleep(0.1)
     # <then write data>
     ser.write(payload)
-    sleep(0.5)
-    print('action')
-    payload='{"val":123}'.encode()
+    sleep(0.1)
     ser.write(b'AT+HTTPACTION=1\r\n')
-    sleep(0.5)
-    print('wait')
+    sleep(0.1)
     http_ready.wait()
-    resp = http_resp
-    print(f"Your response is: {resp}")
-    print('Done! Press enter to continue.')
-    readline()
+    status, resp = http_resp
+    data = json.loads(resp)
+    resp_plain = decrypt(data['enc_response'])
+    # print(f"{status=}, {resp=}")
+    resp_data = json.loads(resp_plain)
+    
+    sz = os.get_terminal_size()
+    rows = sz.lines
+    cols = sz.columns
+    rendered_lines = [
+            f"(Do not use while driving. Write down on paper beforehand.)",
+            f"Directions to: {resp_data['resolved_address']}",
+            f"(ESC to exit)",
+            ]
+    meters_per_mile = 1609.34
+    for step in resp_data['steps']:
+        miles = step[1] / meters_per_mile
+        rendered_lines.append(step[0])
+        rendered_lines.append(f"Then {miles:.2f} mi")
+        # all newlines must be 'empty lines' in this view, because line count math
+        # is based on list length
+        rendered_lines.append('')
+    rendered_lines.append(f"Arrive at: {resp_data['resolved_address']}")
 
-    # search new coord
-    # curl "https://api.mapbox.com/search/geocode/v6/forward?q=3500+Cookstown+Dr+Austin+Tx&access_token=$MAPBOX_TOKEN"
+    rendered_lines = (rows - len(rendered_lines)) * [''] + rendered_lines
+    last_line_idx = len(rendered_lines) - 1
 
-    # nav to coord
-    # url encode: long/lat, %2C = ',', %3B = ';'
-    # curl "https://api.mapbox.com/directions/v5/mapbox/driving/-74.150434%2C40.811716%3B-74.136459%2C40.794178?alternatives=true&geometries=geojson&language=en&overview=full&steps=true&access_token=<tok>"
-
-    """
-    # distances in meters
-     $ jq '.routes[].legs[].steps[] | .maneuver.instruction, .distance' < instruction.json
-        "Drive northeast on Havelock Drive."
-        66.595
-        "Turn right onto Gable Drive."
-        164.972
-        "Turn right onto Adelphi Lane."
-        428.936
-        "Turn right onto Waters Park Road."
-        757.518
-        "Bear right onto North Mopac Service Road."
-        644.145
-        "Turn left onto Duval Road/FM 1325. Continue on FM 1325."
-        1282.02
-        "Turn left onto Esperanza Crossing."
-        103.685
-        "Turn left."
-        18.364
-        "Turn right."
-        10.525
-        "Bear right."
-        31.107
-        "Your destination is on the right."
-        0
-    """
+    while True:
+        # print(f"{last_line_idx=} {len(rendered_lines)=} {rows=}")
+        # sleep(2)
+        print(''.join((CLEAR, HOME)), end='')
+        print('\n'.join(rendered_lines[last_line_idx - rows + 1:last_line_idx + 1]), end='')
+        k = _stdin.read(1).decode()
+        if k == 'j' and last_line_idx < len(rendered_lines) - 1:
+            last_line_idx += 1
+        elif k == 'k' and last_line_idx >= rows:
+            last_line_idx -= 1
+        elif k == '\033':
+            break
 
 def print_menu(menu, init_cursor):
     sz = os.get_terminal_size()
